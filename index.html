@@ -2593,17 +2593,37 @@
 const SUPABASE_URL = 'https://awfxdziicxrrkvmnjaax.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_mMKlJHUKqFVU_VA2TgxWDg_9Ae5WeyL';
 
-/* Computed flag: are we in multi-user mode? */
-const CLOUD_MODE = !!(SUPABASE_URL && SUPABASE_KEY && window.supabase);
+/* Computed flag: are we in multi-user mode? Only true if BOTH:
+   - The user has filled in URL and KEY constants above
+   - The Supabase CDN library has loaded successfully
+   - The client initialized without error
+   If anything fails, the app silently falls back to single-user localStorage mode. */
+const _CLOUD_CONFIG_PROVIDED = !!(SUPABASE_URL && SUPABASE_KEY);
+const _SUPABASE_LIB_LOADED   = !!(typeof window !== 'undefined' && window.supabase && typeof window.supabase.createClient === 'function');
 
-/* The Supabase client (only created if CLOUD_MODE is true) */
-const sb = CLOUD_MODE ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
-  auth: {
-    persistSession: true,
-    autoRefreshToken: true,
-    detectSessionInUrl: true
+if (_CLOUD_CONFIG_PROVIDED && !_SUPABASE_LIB_LOADED) {
+  console.warn('[CFMS] Supabase URL/key are set, but the Supabase library did not load. Running in single-user mode.');
+}
+
+/* The Supabase client. Wrapped in try/catch so a bad URL/key never crashes page load. */
+let sb = null;
+if (_CLOUD_CONFIG_PROVIDED && _SUPABASE_LIB_LOADED) {
+  try {
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true
+      }
+    });
+  } catch (e) {
+    console.error('[CFMS] Failed to initialize Supabase client. Falling back to single-user mode.', e);
+    sb = null;
   }
-}) : null;
+}
+
+/* Final flag — true only if everything actually worked */
+const CLOUD_MODE = !!sb;
 
 /* Auth state */
 let currentUser = null;          // { id, email, name } or null
@@ -5543,26 +5563,33 @@ async function init() {
     document.getElementById('sidebarBackdrop').classList.remove('show');
   });
 
+  // CRITICAL: always load local data and render the UI FIRST.
+  // This guarantees the user sees the app even if cloud sync fails.
+  loadDataLocal();
+  render();
+
   if (CLOUD_MODE) {
     // Cloud mode: enable "use offline" fallback button on login screen
     const fallback = document.getElementById('authFallback');
     if (fallback) fallback.style.display = 'block';
 
-    // Initialize auth — returns user if already signed in, otherwise null
-    const user = await initAuth();
-    if (user) {
-      await loadData();
-      subscribeRealtime();
-      render();
-    } else {
-      // Login overlay is shown; render the app behind it so it's ready
-      loadDataLocal();
-      render();
+    try {
+      // Initialize auth — may show login overlay
+      const user = await initAuth();
+      if (user) {
+        // User already signed in — replace local data with cloud data
+        await loadData();
+        subscribeRealtime();
+        render();
+      }
+      // If no user, the login overlay is now showing on top of the rendered UI
+    } catch (e) {
+      console.error('[CFMS] Auth/cloud init failed. Falling back to local mode.', e);
+      // Hide the login overlay so the user can still use the app
+      const overlay = document.getElementById('authOverlay');
+      if (overlay) overlay.style.display = 'none';
+      showToast('Cloud connection failed — using offline mode. Check console for details.', 'error');
     }
-  } else {
-    // Single-user mode: just load from localStorage
-    loadDataLocal();
-    render();
   }
 }
 
@@ -5595,11 +5622,20 @@ window.exportBackup = exportBackup;
 window.importBackup = importBackup;
 window.resetAllData = resetAllData;
 
-// Start the app
+// Start the app — wrapped in safety net so an unexpected init error
+// still leaves a usable app instead of a blank page.
+function safeInit() {
+  try {
+    init();
+  } catch (e) {
+    console.error('[CFMS] init() threw synchronously. Recovering...', e);
+    try { loadDataLocal(); render(); } catch (e2) { console.error('Even local fallback failed:', e2); }
+  }
+}
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', init);
+  document.addEventListener('DOMContentLoaded', safeInit);
 } else {
-  init();
+  safeInit();
 }
 </script>
 
