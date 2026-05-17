@@ -5,6 +5,38 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Construction Follow-up Management System</title>
 <style>
+  /* ============================================================
+     EARLY GATING CSS — applies before anything else paints.
+     The app shell is hidden by default. The boot script removes
+     the gating class once auth completes (or once we know there is
+     no auth, e.g. single-user mode).
+     ============================================================ */
+  .app-hidden-until-auth { display: none !important; }
+
+  /* Initial loading screen — shown while we determine auth state. */
+  .auth-loading {
+    position: fixed;
+    inset: 0;
+    background: #F8FAFC;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 16px;
+    z-index: 300;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #64748B;
+  }
+  .auth-loading-spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid #E2E8F0;
+    border-top-color: #1E40AF;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
   /* ================================================================
      DESIGN SYSTEM — Construction FMS
      ================================================================
@@ -2478,7 +2510,7 @@
 </head>
 <body>
 
-<div class="app">
+<div class="app app-hidden-until-auth" id="appShell">
   <!-- ============================================================
        SIDEBAR
        ============================================================ -->
@@ -2540,6 +2572,12 @@
 <div class="popover-backdrop" id="popoverBackdrop"></div>
 <div class="popover" id="popover" style="display:none;"></div>
 
+<!-- Initial loading screen — shown until we know whether to show login or app -->
+<div class="auth-loading" id="authLoading">
+  <div class="auth-loading-spinner"></div>
+  <div>Loading...</div>
+</div>
+
 <!-- Login overlay (shown only when Supabase mode is enabled and user is not signed in) -->
 <div class="auth-overlay" id="authOverlay" style="display:none;">
   <div class="auth-card">
@@ -2558,10 +2596,6 @@
       <span>Sign in with Google</span>
     </button>
     <p class="auth-hint">After your first sign-in, you'll stay signed in on this device.</p>
-    <p class="auth-fallback" id="authFallback" style="display:none;">
-      Or use the app in single-user mode without sign-in — your data will stay on this device only.
-      <button class="auth-link-btn" id="useLocalBtn">Use offline mode</button>
-    </p>
   </div>
 </div>
 
@@ -2705,18 +2739,6 @@ async function initAuth() {
     btn.addEventListener('click', signInWithGoogle);
   }
 
-  // Wire up the offline-mode fallback
-  const localBtn = document.getElementById('useLocalBtn');
-  if (localBtn) {
-    localBtn.addEventListener('click', () => {
-      // Force single-user mode for this session
-      window.__force_local__ = true;
-      document.getElementById('authOverlay').style.display = 'none';
-      loadDataLocal();
-      render();
-    });
-  }
-
   // Check for existing session (set by Supabase from URL or persisted storage)
   const { data: { session } } = await sb.auth.getSession();
   if (session && session.user) {
@@ -2725,12 +2747,8 @@ async function initAuth() {
       email: session.user.email,
       name: session.user.user_metadata?.full_name || session.user.email
     };
-    document.getElementById('authOverlay').style.display = 'none';
     return currentUser;
   }
-
-  // Not signed in — show login overlay
-  document.getElementById('authOverlay').style.display = 'flex';
 
   // Also listen for future sign-ins (e.g. when redirect completes)
   sb.auth.onAuthStateChange((event, session) => {
@@ -2740,15 +2758,18 @@ async function initAuth() {
         email: session.user.email,
         name: session.user.user_metadata?.full_name || session.user.email
       };
-      document.getElementById('authOverlay').style.display = 'none';
       loadData().then(() => {
         subscribeRealtime();
         render();
+        revealApp();
       });
     } else if (event === 'SIGNED_OUT') {
       currentUser = null;
       if (realtimeChannel) { sb.removeChannel(realtimeChannel); realtimeChannel = null; }
-      document.getElementById('authOverlay').style.display = 'flex';
+      // Hide the app shell again so signed-out state can't see data
+      const shell = document.getElementById('appShell');
+      if (shell) shell.classList.add('app-hidden-until-auth');
+      showLoginScreen();
     }
   });
 
@@ -3371,6 +3392,29 @@ function renderIcons() {
     svg.innerHTML = inner;
     el.replaceWith(svg);
   });
+}
+
+/* ================================================================
+   GATE HELPERS — control what the user sees during boot
+   ================================================================ */
+function hideLoadingScreen() {
+  const el = document.getElementById('authLoading');
+  if (el) el.style.display = 'none';
+}
+
+function revealApp() {
+  hideLoadingScreen();
+  const shell = document.getElementById('appShell');
+  if (shell) shell.classList.remove('app-hidden-until-auth');
+  const overlay = document.getElementById('authOverlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+function showLoginScreen() {
+  hideLoadingScreen();
+  // App shell stays hidden — login overlay shows alone
+  const overlay = document.getElementById('authOverlay');
+  if (overlay) overlay.style.display = 'flex';
 }
 
 /* -----------------------------------------------------------------
@@ -5563,33 +5607,34 @@ async function init() {
     document.getElementById('sidebarBackdrop').classList.remove('show');
   });
 
-  // CRITICAL: always load local data and render the UI FIRST.
-  // This guarantees the user sees the app even if cloud sync fails.
-  loadDataLocal();
-  render();
-
   if (CLOUD_MODE) {
-    // Cloud mode: enable "use offline" fallback button on login screen
-    const fallback = document.getElementById('authFallback');
-    if (fallback) fallback.style.display = 'block';
-
+    // Multi-user mode: gate everything behind sign-in.
+    // App shell stays hidden until auth succeeds.
     try {
-      // Initialize auth — may show login overlay
       const user = await initAuth();
       if (user) {
-        // User already signed in — replace local data with cloud data
+        // Already signed in — load cloud data, render, and reveal
         await loadData();
         subscribeRealtime();
         render();
+        revealApp();
+      } else {
+        // Not signed in — show only the login screen
+        // (Don't pre-render the app — keep it hidden until they sign in)
+        showLoginScreen();
       }
-      // If no user, the login overlay is now showing on top of the rendered UI
     } catch (e) {
-      console.error('[CFMS] Auth/cloud init failed. Falling back to local mode.', e);
-      // Hide the login overlay so the user can still use the app
-      const overlay = document.getElementById('authOverlay');
-      if (overlay) overlay.style.display = 'none';
-      showToast('Cloud connection failed — using offline mode. Check console for details.', 'error');
+      console.error('[CFMS] Auth init failed:', e);
+      // Even on failure, show the login screen (don't expose the app)
+      showLoginScreen();
+      // Display a clear error on the login card
+      showAuthError('Could not connect to the server. Please refresh and try again. (' + (e.message || 'unknown error') + ')');
     }
+  } else {
+    // Single-user / local-only mode — no login required, reveal immediately
+    loadDataLocal();
+    render();
+    revealApp();
   }
 }
 
@@ -5623,13 +5668,26 @@ window.importBackup = importBackup;
 window.resetAllData = resetAllData;
 
 // Start the app — wrapped in safety net so an unexpected init error
-// still leaves a usable app instead of a blank page.
+// still leaves the user on a sane state (login screen if cloud mode, or local app if single-user).
 function safeInit() {
   try {
     init();
   } catch (e) {
     console.error('[CFMS] init() threw synchronously. Recovering...', e);
-    try { loadDataLocal(); render(); } catch (e2) { console.error('Even local fallback failed:', e2); }
+    try {
+      if (CLOUD_MODE) {
+        // Cloud mode: keep app hidden, show login screen with error
+        showLoginScreen();
+        showAuthError('Failed to start the app. Please refresh.');
+      } else {
+        // Local mode: render the app anyway
+        loadDataLocal();
+        render();
+        revealApp();
+      }
+    } catch (e2) {
+      console.error('Even local fallback failed:', e2);
+    }
   }
 }
 if (document.readyState === 'loading') {
